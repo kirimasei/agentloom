@@ -14,6 +14,29 @@ from agentloom.worker.adapters import BaseAdapter, StreamCallback
 log = logging.getLogger("agentloom.worker.openai")
 
 
+async def _call_non_streaming(
+    endpoint: str,
+    headers: dict[str, str],
+    payload: dict,
+    timeout: int,
+) -> Optional[str]:
+    """Call /chat/completions with stream=False."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(endpoint, headers=headers, json={**payload, "stream": False})
+            if r.status_code != 200:
+                log.error(f"OpenAI API HTTP {r.status_code}: {r.text[:300]}")
+                return None
+            data = r.json()
+            choices = data.get("choices") or []
+            if choices:
+                return ((choices[0].get("message") or {}).get("content") or "").strip() or None
+            return None
+    except Exception as exc:
+        log.error(f"OpenAI API call failed: {exc}")
+        return None
+
+
 async def call_openai_chat(
     endpoint: str,
     headers: dict[str, str],
@@ -23,62 +46,70 @@ async def call_openai_chat(
 ) -> Optional[str]:
     """Call an OpenAI-compatible /chat/completions endpoint with optional SSE streaming."""
     if on_chunk is None:
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                r = await client.post(endpoint, headers=headers, json={**payload, "stream": False})
-                if r.status_code != 200:
-                    log.error(f"OpenAI API HTTP {r.status_code}: {r.text[:300]}")
-                    return None
-                data = r.json()
-                choices = data.get("choices") or []
-                if choices:
-                    return ((choices[0].get("message") or {}).get("content") or "").strip()
-                return None
-        except Exception as exc:
-            log.error(f"OpenAI API call failed: {exc}")
-            return None
+        return await _call_non_streaming(endpoint, headers, payload, timeout)
 
     chunks: list[str] = []
+    need_fallback = False
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15.0)) as client:
             async with client.stream("POST", endpoint, headers=headers, json={**payload, "stream": True}) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
-                    log.error(f"OpenAI Stream HTTP {resp.status_code}: {body.decode('utf-8', errors='replace')[:300]}")
-                    return None
-                ctype = (resp.headers.get("content-type") or "").lower()
-                if "text/event-stream" not in ctype:
-                    raw = await resp.aread()
-                    data = json.loads(raw.decode("utf-8", errors="replace"))
-                    choices = data.get("choices") or []
-                    text = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
-                    if text:
-                        await on_chunk(text)
-                    return text or None
-
-                async for raw_line in resp.aiter_lines():
-                    line = raw_line.strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if not data_str or data_str == "[DONE]":
-                        continue
-                    try:
-                        ev = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    choices = ev.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = ((choices[0].get("delta") or {}).get("content")) or ""
-                    if delta:
-                        chunks.append(delta)
-                        await on_chunk(delta)
-        full = "".join(chunks).strip()
-        return full or None
+                    log.warning(
+                        f"OpenAI Stream HTTP {resp.status_code}: {body.decode('utf-8', errors='replace')[:200]}; "
+                        "falling back to non-streaming"
+                    )
+                    need_fallback = True
+                else:
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    if "text/event-stream" not in ctype:
+                        raw = await resp.aread()
+                        data = json.loads(raw.decode("utf-8", errors="replace"))
+                        choices = data.get("choices") or []
+                        text = ((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+                        if text:
+                            await on_chunk(text)
+                            return text
+                        log.warning("OpenAI non-SSE response returned empty content; falling back")
+                        need_fallback = True
+                    else:
+                        async for raw_line in resp.aiter_lines():
+                            line = raw_line.strip()
+                            if not line.startswith("data:"):
+                                continue
+                            data_str = line[5:].strip()
+                            if not data_str or data_str == "[DONE]":
+                                continue
+                            try:
+                                ev = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+                            choices = ev.get("choices") or []
+                            if not choices:
+                                continue
+                            delta = ((choices[0].get("delta") or {}).get("content")) or ""
+                            if delta:
+                                chunks.append(delta)
+                                await on_chunk(delta)
+        if not need_fallback:
+            full = "".join(chunks).strip()
+            if full:
+                return full
+            log.warning("OpenAI stream returned empty content; falling back to non-streaming")
+            need_fallback = True
+    except (httpx.TimeoutException, httpx.ConnectError) as exc:
+        log.error(f"OpenAI stream call failed: {exc}")
+        return None
     except Exception as exc:
         log.error(f"OpenAI stream call failed: {exc}")
         return None
+
+    if need_fallback:
+        fallback = await _call_non_streaming(endpoint, headers, payload, timeout)
+        if fallback:
+            await on_chunk(fallback)
+        return fallback
+    return None
 
 
 class OpenAICompatAdapter(BaseAdapter):

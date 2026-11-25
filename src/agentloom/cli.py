@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 import urllib.error
@@ -28,6 +29,11 @@ def _cmd_hub(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     cfg = HubConfig.from_env()
     if args.host:
         cfg.host = args.host
@@ -55,6 +61,11 @@ def _cmd_worker(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     token = (args.token or os.environ.get("AGENTLOOM_TOKEN") or "").strip()
     if not token and args.token_file and os.path.isfile(args.token_file):
         with open(args.token_file, "r", encoding="utf-8") as f:

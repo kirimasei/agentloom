@@ -299,3 +299,102 @@ async def test_v2_streaming_artifacts_and_hitl_approvals(tmp_path):
         worker.stop()
         server.should_exit = True
         await asyncio.gather(worker_task, server_task, return_exceptions=True)
+
+
+def test_hub_config_reads_admin_token_file(tmp_path, monkeypatch):
+    tok_file = tmp_path / "admin.secret"
+    tok_file.write_text("  file-admin-secret-123 \n", encoding="utf-8")
+    monkeypatch.delenv("AGENTLOOM_ADMIN_TOKEN", raising=False)
+    monkeypatch.delenv("AGENT_CHAT_SECRET", raising=False)
+    monkeypatch.setenv("AGENTLOOM_ADMIN_TOKEN_FILE", str(tok_file))
+
+    cfg = HubConfig.from_env()
+    assert cfg.admin_token == "file-admin-secret-123"
+
+
+@pytest.mark.asyncio
+async def test_call_openai_chat_non_streaming_fallback(monkeypatch):
+    from agentloom.worker.adapters import openai_compat
+
+    class DummyResponse:
+        def __init__(self, status_code, headers=None, json_data=None, lines=None, body=b""):
+            self.status_code = status_code
+            self.headers = headers or {}
+            self._json = json_data or {}
+            self._lines = lines or []
+            self._body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aread(self):
+            return self._body
+
+        async def aiter_lines(self):
+            for ln in self._lines:
+                yield ln
+
+        def json(self):
+            return self._json
+
+        @property
+        def text(self):
+            return self._body.decode("utf-8", errors="replace")
+
+    # Case 1: stream HTTP 400 -> fallback to non-streaming
+    calls = []
+
+    class DummyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, method, url, headers=None, json=None):
+            calls.append(("stream", json.get("stream")))
+            return DummyResponse(400, body=b"streaming unsupported")
+
+        async def post(self, url, headers=None, json=None):
+            calls.append(("post", json.get("stream")))
+            return DummyResponse(200, json_data={"choices": [{"message": {"content": "fallback-ok"}}]})
+
+    monkeypatch.setattr(openai_compat.httpx, "AsyncClient", DummyClient)
+    chunks = []
+
+    async def on_chunk(d: str) -> None:
+        chunks.append(d)
+
+    res = await openai_compat.call_openai_chat("http://localhost/v1/chat/completions", {}, {"model": "m"}, 10, on_chunk=on_chunk)
+    assert res == "fallback-ok"
+    assert chunks == ["fallback-ok"]
+    assert calls == [("stream", True), ("post", False)]
+
+    # Case 2: empty SSE stream -> fallback to non-streaming
+    calls2 = []
+
+    class DummyClientEmptyStream(DummyClient):
+        def stream(self, method, url, headers=None, json=None):
+            calls2.append(("stream", json.get("stream")))
+            return DummyResponse(200, headers={"content-type": "text/event-stream"}, lines=["data: [DONE]"])
+
+        async def post(self, url, headers=None, json=None):
+            calls2.append(("post", json.get("stream")))
+            return DummyResponse(200, json_data={"choices": [{"message": {"content": "empty-stream-fallback"}}]})
+
+    monkeypatch.setattr(openai_compat.httpx, "AsyncClient", DummyClientEmptyStream)
+    chunks2 = []
+
+    async def on_chunk2(d: str) -> None:
+        chunks2.append(d)
+
+    res2 = await openai_compat.call_openai_chat("http://localhost/v1/chat/completions", {}, {"model": "m"}, 10, on_chunk=on_chunk2)
+    assert res2 == "empty-stream-fallback"
+    assert chunks2 == ["empty-stream-fallback"]
+    assert calls2 == [("stream", True), ("post", False)]

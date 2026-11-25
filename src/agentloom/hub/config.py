@@ -35,15 +35,24 @@ class HubConfig:
 
     @classmethod
     def from_env(cls) -> "HubConfig":
+        admin_token = (
+            os.environ.get("AGENTLOOM_ADMIN_TOKEN")
+            or os.environ.get("AGENT_CHAT_SECRET")
+            or ""
+        ).strip()
+        if not admin_token:
+            token_file = os.environ.get("AGENTLOOM_ADMIN_TOKEN_FILE", "").strip()
+            if token_file and os.path.isfile(token_file):
+                try:
+                    with open(token_file, "r", encoding="utf-8") as f:
+                        admin_token = f.read().strip()
+                except OSError:
+                    pass
         return cls(
             host=os.environ.get("AGENTLOOM_HOST", "0.0.0.0").strip() or "0.0.0.0",
             port=int(os.environ.get("AGENTLOOM_PORT", "3000")),
             data_dir=os.environ.get("AGENTLOOM_DATA_DIR", "./data").strip() or "./data",
-            admin_token=(
-                os.environ.get("AGENTLOOM_ADMIN_TOKEN")
-                or os.environ.get("AGENT_CHAT_SECRET")
-                or ""
-            ).strip(),
+            admin_token=admin_token,
             max_rounds=int(os.environ.get("AGENTLOOM_MAX_ROUNDS", "30")),
             max_replies_per_hour=int(os.environ.get("AGENTLOOM_MAX_REPLIES_PER_HOUR", "60")),
             agent_alive_timeout=int(os.environ.get("AGENTLOOM_AGENT_TIMEOUT", "90")),
