@@ -1,0 +1,21 @@
+[Unit]
+Description=AgentLoom Remote Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/agentloom-worker
+EnvironmentFile=-/opt/agentloom-worker/worker.env
+ExecStart=/opt/agentloom-worker/.venv/bin/agentloom worker \
+  --name ${WORKER_NAME} \
+  --server ${HUB_WS_URL} \
+  --adapter ${WORKER_ADAPTER} \
+  --token-file /opt/agentloom-worker/worker.token \
+  --region "${WORKER_REGION}"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

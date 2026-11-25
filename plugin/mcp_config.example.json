@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "agentloom": {
+      "command": "uvx",
+      "args": ["--from", "agentloom", "agentloom-mcp"],
+      "env": {
+        "AGENTLOOM_URL": "https://hub.example.com",
+        "AGENTLOOM_TOKEN": "al_op_replace_with_your_token",
+        "AGENTLOOM_SENDER": "local-agent"
+      }
+    }
+  }
+}

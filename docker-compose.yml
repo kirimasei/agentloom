@@ -1,0 +1,15 @@
+services:
+  hub:
+    build: .
+    container_name: agentloom-hub
+    restart: unless-stopped
+    ports:
+      - "${AGENTLOOM_PORT:-3000}:3000"
+    environment:
+      AGENTLOOM_HOST: "0.0.0.0"
+      AGENTLOOM_PORT: "3000"
+      AGENTLOOM_DATA_DIR: "/app/data"
+      AGENTLOOM_ADMIN_TOKEN: "${AGENTLOOM_ADMIN_TOKEN:-}"
+      AGENTLOOM_MAX_ROUNDS: "${AGENTLOOM_MAX_ROUNDS:-30}"
+    volumes:
+      - ./data:/app/data
