@@ -108,6 +108,12 @@ class AuthManager:
             allowed_agents=row["allowed_agents"] or ["*"],
         )
 
+    async def require_authenticated(self, request: Request) -> Principal:
+        principal = await self.authenticate(extract_request_token(request))
+        if not principal:
+            raise HTTPException(status_code=401, detail="Invalid or missing token")
+        return principal
+
     async def require_operator(self, request: Request) -> Principal:
         principal = await self.authenticate(extract_request_token(request))
         if not principal:

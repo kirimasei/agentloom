@@ -7,7 +7,7 @@ import logging
 import shlex
 from typing import Optional
 
-from agentloom.worker.adapters import BaseAdapter
+from agentloom.worker.adapters import BaseAdapter, StreamCallback
 
 log = logging.getLogger("agentloom.worker.cli")
 
@@ -36,7 +36,14 @@ class CLIExecAdapter(BaseAdapter):
             self.argv_template = list(CLI_PRESETS[preset_key])
             self.adapter_name = f"cli:{preset_key}"
 
-    async def invoke(self, prompt: str, thread_id: str, sender: str, raw_msg: dict) -> Optional[str]:
+    async def invoke(
+        self,
+        prompt: str,
+        thread_id: str,
+        sender: str,
+        raw_msg: dict,
+        on_chunk: Optional[StreamCallback] = None,
+    ) -> Optional[str]:
         has_placeholder = any("{prompt}" in tok for tok in self.argv_template)
         argv = [
             tok.replace("{prompt}", prompt).replace("{thread_id}", thread_id)
@@ -51,13 +58,39 @@ class CLIExecAdapter(BaseAdapter):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=stdin_bytes),
-                timeout=self.timeout,
-            )
-            out = stdout.decode("utf-8", errors="replace").strip()
-            if proc.returncode != 0:
+            if on_chunk is None:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=stdin_bytes),
+                    timeout=self.timeout,
+                )
+                out = stdout.decode("utf-8", errors="replace").strip()
                 err_txt = stderr.decode("utf-8", errors="replace").strip()
+            else:
+                if proc.stdin and stdin_bytes is not None:
+                    proc.stdin.write(stdin_bytes)
+                    await proc.stdin.drain()
+                    proc.stdin.close()
+
+                chunks: list[str] = []
+
+                async def _drain() -> str:
+                    assert proc.stdout is not None and proc.stderr is not None
+                    stderr_task = asyncio.create_task(proc.stderr.read())
+                    while True:
+                        buf = await proc.stdout.read(1024)
+                        if not buf:
+                            break
+                        text_part = buf.decode("utf-8", errors="replace")
+                        chunks.append(text_part)
+                        await on_chunk(text_part)
+                    err_raw = await stderr_task
+                    await proc.wait()
+                    return err_raw.decode("utf-8", errors="replace").strip()
+
+                err_txt = await asyncio.wait_for(_drain(), timeout=self.timeout)
+                out = "".join(chunks).strip()
+
+            if proc.returncode != 0:
                 log.warning(f"CLI '{argv[0]}' exited {proc.returncode}: {err_txt[:300]}")
                 return out or f"[CLI exited {proc.returncode}] {err_txt[:500]}"
             return out or "(empty output)"

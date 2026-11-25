@@ -8,7 +8,7 @@ from typing import Optional
 
 import httpx
 
-from agentloom.worker.adapters import BaseAdapter
+from agentloom.worker.adapters import BaseAdapter, StreamCallback
 
 log = logging.getLogger("agentloom.worker.qwenpaw")
 
@@ -43,7 +43,14 @@ class QwenPawAdapter(BaseAdapter):
         self.api_url = (api_url or "http://127.0.0.1:8088").rstrip("/")
         self.timeout = timeout
 
-    async def invoke(self, prompt: str, thread_id: str, sender: str, raw_msg: dict) -> Optional[str]:
+    async def invoke(
+        self,
+        prompt: str,
+        thread_id: str,
+        sender: str,
+        raw_msg: dict,
+        on_chunk: Optional[StreamCallback] = None,
+    ) -> Optional[str]:
         payload = {
             "input": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
             "session_id": f"agentloom-{thread_id}" if thread_id else "agentloom",
@@ -91,7 +98,10 @@ class QwenPawAdapter(BaseAdapter):
                             mid = ev.get("msg_id") or "_default"
                             if mid not in msg_order:
                                 msg_order.append(mid)
-                            msg_texts.setdefault(mid, []).append(ev.get("text") or "")
+                            delta_txt = ev.get("text") or ""
+                            msg_texts.setdefault(mid, []).append(delta_txt)
+                            if delta_txt and on_chunk and msg_types.get(mid) != "reasoning":
+                                await on_chunk(delta_txt)
 
                         if ev.get("object") == "response" and ev.get("status") == "completed":
                             out_txt = extract_text_from_output(ev.get("output") or [])

@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
+import mimetypes
 import os
 import sys
 import time
@@ -68,11 +71,7 @@ TOOLS = [
     {
         "name": "agentloom_list_agents",
         "description": "List all remote worker nodes accessible by the current token along with online and execution status.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "agentloom_send",
@@ -105,15 +104,11 @@ TOOLS = [
     {
         "name": "agentloom_list_threads",
         "description": "List collaboration threads accessible by the current token.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "agentloom_get_thread",
-        "description": "Fetch messages and metadata for a specific collaboration thread.",
+        "description": "Fetch messages, artifacts, and metadata for a specific collaboration thread.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -143,6 +138,49 @@ TOOLS = [
             "required": ["agent", "action"],
         },
     },
+    {
+        "name": "agentloom_upload_artifact",
+        "description": "Upload a local file or text log/config artifact to the Hub (optionally attached to a thread).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string", "description": "Artifact filename (defaults to basename of file_path)"},
+                "file_path": {"type": "string", "description": "Path to a local file to upload"},
+                "content_text": {"type": "string", "description": "UTF-8 text content if file_path is omitted"},
+                "thread_id": {"type": "string", "description": "Optional thread ID to attach this artifact to"},
+                "content_type": {"type": "string", "description": "Optional MIME type"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "agentloom_download_artifact",
+        "description": "Download an artifact from the Hub to a local path or return UTF-8 text if small.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string", "description": "Artifact ID (e.g. art_179558_abcd1234)"},
+                "save_path": {"type": "string", "description": "Optional local file path to save the downloaded bytes"},
+            },
+            "required": ["artifact_id"],
+        },
+    },
+    {
+        "name": "agentloom_request_approval",
+        "description": "Create a human-in-the-loop approval request on the Hub and optionally wait for an admin decision.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "Short action identifier (e.g. deploy-prod, db-migrate)"},
+                "summary": {"type": "string", "description": "Human-readable description of the sensitive operation"},
+                "thread_id": {"type": "string", "description": "Optional collaboration thread ID"},
+                "target_agent": {"type": "string", "description": "Optional target worker node"},
+                "wait_for_decision": {"type": "boolean", "default": True},
+                "timeout": {"type": "integer", "default": 180},
+            },
+            "required": ["action", "summary"],
+        },
+    },
 ]
 
 
@@ -152,14 +190,20 @@ class AgentLoomMCPClient:
         self.token = token
         self.sender = sender
 
-    def api_request(self, method: str, path: str, body: Optional[dict] = None, timeout: int = 30) -> dict:
+    def _raw_request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[dict] = None,
+        timeout: int = 30,
+    ) -> tuple[Optional[bytes], Optional[str]]:
         if not self.token:
-            return {"error": "AGENTLOOM_TOKEN is not configured. Set AGENTLOOM_TOKEN or pass --token."}
+            return None, "AGENTLOOM_TOKEN is not configured. Set AGENTLOOM_TOKEN or pass --token."
         url = f"{self.base_url}{path}"
         data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
         headers = {
             "X-Token": self.token,
-            "Accept": "application/json",
+            "Accept": "*/*",
             "User-Agent": f"agentloom-mcp/{__version__}",
         }
         if data is not None:
@@ -170,8 +214,7 @@ class AgentLoomMCPClient:
             req = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    raw = resp.read().decode("utf-8", errors="replace")
-                    return json.loads(raw) if raw else {"ok": True}
+                    return resp.read(), None
             except urllib.error.HTTPError as exc:
                 err_body = exc.read().decode("utf-8", errors="replace")
                 if exc.code in (502, 503, 504, 520, 522, 524) and attempt < 2:
@@ -179,13 +222,21 @@ class AgentLoomMCPClient:
                     time.sleep(1.5)
                     continue
                 if exc.code == 403:
-                    return {"error": f"HTTP 403 Forbidden: {err_body[:300]} (admin or ACL permission required)"}
-                return {"error": f"HTTP {exc.code}: {err_body[:400]}"}
+                    return None, f"HTTP 403 Forbidden: {err_body[:300]} (admin or ACL permission required)"
+                return None, f"HTTP {exc.code}: {err_body[:400]}"
             except Exception as exc:
                 last_err = exc
                 if attempt < 2:
                     time.sleep(1.5)
-        return {"error": f"Request failed after 3 attempts: {last_err}"}
+        return None, f"Request failed after 3 attempts: {last_err}"
+
+    def api_request(self, method: str, path: str, body: Optional[dict] = None, timeout: int = 30) -> dict:
+        raw_bytes, err = self._raw_request(method, path, body=body, timeout=timeout)
+        if err is not None:
+            return {"error": err}
+        if not raw_bytes:
+            return {"ok": True}
+        return json.loads(raw_bytes.decode("utf-8", errors="replace"))
 
     def handle_tool_call(self, name: str, args: dict) -> dict:
         if name == "agentloom_list_agents":
@@ -267,6 +318,121 @@ class AgentLoomMCPClient:
             if not agent or action not in ("restart",):
                 return {"error": "agent and valid action ('restart') are required"}
             return self.api_request("POST", f"/api/agents/{agent}/control", body={"action": action}, timeout=20)
+
+        if name == "agentloom_upload_artifact":
+            file_path = (args.get("file_path") or "").strip()
+            content_text = args.get("content_text")
+            filename = (args.get("filename") or "").strip()
+            thread_id = (args.get("thread_id") or "").strip() or None
+            content_type = (args.get("content_type") or "").strip()
+
+            payload: dict = {"thread_id": thread_id}
+            if file_path:
+                if not os.path.isfile(file_path):
+                    return {"error": f"Local file not found: {file_path}"}
+                with open(file_path, "rb") as f:
+                    raw = f.read()
+                filename = filename or os.path.basename(file_path)
+                guessed, _ = mimetypes.guess_type(filename)
+                payload["filename"] = filename
+                payload["content_base64"] = base64.b64encode(raw).decode("ascii")
+                payload["content_type"] = content_type or guessed or "application/octet-stream"
+            elif content_text is not None:
+                payload["filename"] = filename or "snippet.txt"
+                payload["content_text"] = str(content_text)
+                payload["content_type"] = content_type or "text/plain; charset=utf-8"
+            else:
+                return {"error": "Either file_path or content_text is required"}
+
+            return self.api_request("POST", "/api/artifacts", body=payload, timeout=60)
+
+        if name == "agentloom_download_artifact":
+            artifact_id = (args.get("artifact_id") or "").strip()
+            save_path = (args.get("save_path") or "").strip()
+            if not artifact_id:
+                return {"error": "artifact_id is required"}
+            meta = self.api_request("GET", f"/api/artifacts/{artifact_id}", timeout=15)
+            if "error" in meta:
+                return meta
+            raw_bytes, err = self._raw_request("GET", f"/api/artifacts/{artifact_id}/download", timeout=60)
+            if err is not None or raw_bytes is None:
+                return {"error": err or "Download failed"}
+            sha = hashlib.sha256(raw_bytes).hexdigest()
+            if save_path:
+                parent = os.path.dirname(os.path.abspath(save_path))
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(save_path, "wb") as f:
+                    f.write(raw_bytes)
+                return {
+                    "ok": True,
+                    "artifact_id": artifact_id,
+                    "filename": meta.get("filename"),
+                    "save_path": os.path.abspath(save_path),
+                    "size_bytes": len(raw_bytes),
+                    "sha256": sha,
+                    "sha256_match": sha == meta.get("sha256"),
+                }
+            if len(raw_bytes) <= 32768:
+                try:
+                    return {
+                        "ok": True,
+                        "artifact_id": artifact_id,
+                        "filename": meta.get("filename"),
+                        "size_bytes": len(raw_bytes),
+                        "sha256": sha,
+                        "text": raw_bytes.decode("utf-8"),
+                    }
+                except UnicodeDecodeError:
+                    pass
+            return {
+                "ok": True,
+                "artifact_id": artifact_id,
+                "filename": meta.get("filename"),
+                "size_bytes": len(raw_bytes),
+                "sha256": sha,
+                "note": "Binary or large artifact; pass save_path to write bytes to disk.",
+            }
+
+        if name == "agentloom_request_approval":
+            action = (args.get("action") or "").strip()
+            summary = (args.get("summary") or "").strip()
+            if not action or not summary:
+                return {"error": "action and summary are required"}
+            wait_for_decision = bool(args.get("wait_for_decision", True))
+            timeout = max(5, min(int(args.get("timeout", 180)), 600))
+            res = self.api_request(
+                "POST",
+                "/api/approvals",
+                body={
+                    "action": action,
+                    "summary": summary,
+                    "thread_id": (args.get("thread_id") or "").strip() or None,
+                    "target_agent": (args.get("target_agent") or "").strip(),
+                },
+                timeout=20,
+            )
+            if "error" in res or not wait_for_decision:
+                return res
+            approval = res.get("approval") or {}
+            apr_id = approval.get("id")
+            if not apr_id:
+                return res
+
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                time.sleep(1.5)
+                cur = self.api_request("GET", f"/api/approvals/{apr_id}", timeout=15)
+                if "error" in cur:
+                    return cur
+                if cur.get("status") != "pending":
+                    return {"ok": True, "approval": cur}
+
+            return {
+                "ok": True,
+                "approval": approval,
+                "note": f"Approval {apr_id} still pending after {timeout}s.",
+            }
 
         return {"error": f"Unknown tool: {name}"}
 

@@ -7,9 +7,8 @@ import logging
 import os
 from typing import Optional
 
-import httpx
-
-from agentloom.worker.adapters import BaseAdapter
+from agentloom.worker.adapters import BaseAdapter, StreamCallback
+from agentloom.worker.adapters.openai_compat import call_openai_chat
 
 log = logging.getLogger("agentloom.worker.hermes")
 
@@ -55,7 +54,12 @@ class HermesAdapter(BaseAdapter):
         self.timeout = timeout
         self.adapter_name = "hermes-api" if self.api_url else "hermes-cli"
 
-    async def _call_api(self, prompt: str, thread_id: str) -> Optional[str]:
+    async def _call_api(
+        self,
+        prompt: str,
+        thread_id: str,
+        on_chunk: Optional[StreamCallback] = None,
+    ) -> Optional[str]:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -63,24 +67,16 @@ class HermesAdapter(BaseAdapter):
             "model": "hermes-agent",
             "messages": [{"role": "user", "content": prompt}],
             "user": f"agentloom:{thread_id}",
-            "stream": False,
         }
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                r = await client.post(f"{self.api_url}/v1/chat/completions", headers=headers, json=payload)
-                if r.status_code != 200:
-                    log.error(f"Hermes API HTTP {r.status_code}: {r.text[:300]}")
-                    return None
-                data = r.json()
-                choices = data.get("choices") or []
-                if choices:
-                    return ((choices[0].get("message") or {}).get("content") or "").strip()
-                return None
-        except Exception as exc:
-            log.error(f"Hermes API call failed: {exc}")
-            return None
+        return await call_openai_chat(
+            f"{self.api_url}/v1/chat/completions",
+            headers,
+            payload,
+            self.timeout,
+            on_chunk=on_chunk,
+        )
 
-    async def _call_cli(self, prompt: str) -> Optional[str]:
+    async def _call_cli(self, prompt: str, on_chunk: Optional[StreamCallback] = None) -> Optional[str]:
         cmd = [self.hermes_bin, "chat", "-q", prompt, "-Q"]
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -92,6 +88,8 @@ class HermesAdapter(BaseAdapter):
             out = stdout.decode("utf-8", errors="replace").strip()
             if proc.returncode != 0:
                 log.warning(f"Hermes CLI exited {proc.returncode}: {stderr.decode('utf-8', errors='replace')[:200]}")
+            if out and on_chunk:
+                await on_chunk(out)
             return out or None
         except asyncio.TimeoutError:
             log.warning(f"Hermes CLI timed out after {self.timeout}s")
@@ -104,10 +102,17 @@ class HermesAdapter(BaseAdapter):
             log.error(f"Hermes CLI error: {exc}")
             return None
 
-    async def invoke(self, prompt: str, thread_id: str, sender: str, raw_msg: dict) -> Optional[str]:
+    async def invoke(
+        self,
+        prompt: str,
+        thread_id: str,
+        sender: str,
+        raw_msg: dict,
+        on_chunk: Optional[StreamCallback] = None,
+    ) -> Optional[str]:
         if self.api_url:
-            res = await self._call_api(prompt, thread_id)
+            res = await self._call_api(prompt, thread_id, on_chunk=on_chunk)
             if res is not None:
                 return res
             log.info("Hermes HTTP API unavailable, falling back to CLI...")
-        return await self._call_cli(prompt)
+        return await self._call_cli(prompt, on_chunk=on_chunk)

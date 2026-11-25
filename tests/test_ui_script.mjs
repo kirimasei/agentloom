@@ -88,7 +88,31 @@ assert.ok(tpls.length >= 2 && tpls[0].text.includes('@custom-vps'), 'Dynamic tem
 const badProf = sandbox.getNodeProfile('bad-color-node', 'agent');
 assert.match(badProf.color, /^#[0-9a-f]{6}$/i, 'Invalid hex color must fall back to safe palette');
 
-// 4. Ensure no private host/node strings remain hardcoded in index.html
+// 4. Verify V2 streaming accumulator, artifact bar, and approval card XSS escaping
+assert.equal(sandbox.appendStreamChunk('node-1', 'hello ', 's1'), 'hello ');
+assert.equal(sandbox.appendStreamChunk('node-1', 'world', 's1'), 'hello world');
+assert.equal(sandbox.appendStreamChunk('node-1', 'fresh', 's2'), 'fresh');
+
+const artHtml = sandbox.renderArtifactBarHtml([
+  { id: 'art_1', filename: '<script>x</script>.log', size_bytes: 2048, sha256: 'abc' },
+]);
+assert.ok(!artHtml.includes('<script>x'), 'Artifact filename must be escaped');
+assert.ok(artHtml.includes('2.0 KB'), 'Artifact size formatting should work');
+
+const aprHtml = sandbox.renderApprovalCardsHtml(
+  [{ id: 'apr_1', action: 'rm -rf', requester: 'alice', target_agent: 'node-1', summary: '<img src=x>', status: 'pending' }],
+  true
+);
+assert.ok(!aprHtml.includes('<img'), 'Approval summary must be escaped');
+assert.ok(aprHtml.includes('批准执行'), 'Admin view should include approve button');
+
+const aprOpHtml = sandbox.renderApprovalCardsHtml(
+  [{ id: 'apr_1', action: 'rm -rf', requester: 'alice', target_agent: 'node-1', summary: 'clean', status: 'pending' }],
+  false
+);
+assert.ok(!aprOpHtml.includes('批准执行'), 'Non-admin view must not include approve button');
+
+// 5. Ensure no private host/node strings remain hardcoded in index.html
 assert.ok(!html.includes('us-hermes'), 'index.html should not hardcode us-hermes');
 assert.ok(!html.includes('sg-hermes'), 'index.html should not hardcode sg-hermes');
 assert.ok(!html.includes('/root/.secrets'), 'index.html should not hardcode /root/.secrets');

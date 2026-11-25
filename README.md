@@ -135,11 +135,19 @@ bash deploy/install-worker.sh \
 
 | 角色 | Token 前缀 | 权限范围 |
 | :--- | :--- | :--- |
-| **`admin`** | `al_adm_` | 全部节点访问、签发/吊销子凭证、向节点发送 `restart` 控制命令 |
-| **`operator`** | `al_op_` | 登录 Web UI 或挂载本地 MCP；仅可见并 `@` 其 `allowed_agents` 白名单内的节点与会话；禁止调用控制/凭证管理接口 |
-| **`worker`** | `al_wk_` | 仅允许以白名单内的节点身份通过 `/ws` 接入；无法调用任何 HTTP 管理、消息查询或控制接口 |
+| **`admin`** | `al_adm_` | 全部节点访问、签发/吊销子凭证、向节点发送 `restart` 控制命令、批准/拒绝高危审批 |
+| **`operator`** | `al_op_` | 登录 Web UI 或挂载本地 MCP；仅可见并 `@` 其 `allowed_agents` 白名单内的节点、会话与附件；禁止调用控制/审批决策接口 |
+| **`worker`** | `al_wk_` | 仅允许以白名单内的节点身份通过 `/ws` 接入；支持上传/下载产物，无法调用管理与审批决策接口 |
 
 吊销任意 Token（`DELETE /api/tokens/{id}` 或在 UI 点 `吊销`）时，Hub 会立即拒绝该凭证的新请求并主动断开其现存 WebSocket 连接。
+
+---
+
+## V2 协作增强能力
+
+1. **实时流式进度（`stream_chunk` -> `agent_stream`）**：所有内置适配器（`hermes` / `openai` / `qwenpaw` / `cli` / `echo`）均支持在执行过程中把输出流式推给控制台与线程观察者，长任务无需盲等。
+2. **文件与构建产物中转（`/api/artifacts`）**：支持在 Web 控制台点击 `📎` 上传，或通过 MCP `agentloom_upload_artifact` / `agentloom_download_artifact` 传输日志、配置与小体量构建产物（带 SHA-256 校验、路径清洗与 `X-Content-Type-Options: nosniff`，受限 Token 按线程 ACL 隔离）。
+3. **高危操作人工审批门（HITL Approvals）**：在 Worker 启动时传入 `--require-approval-patterns "rm -rf,systemctl restart,drop table"`，命中规则的任务会先向中枢发起 `approval_request` 暂停等待；只有 `admin` 在控制台「🛡️ 审批」或线程卡片点「批准」后才会放行，否则拦截并回传拒绝说明。
 
 ---
 

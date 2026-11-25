@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Awaitable, Callable, Optional
+
+StreamCallback = Callable[[str], Awaitable[None]]
 
 
 class BaseAdapter(ABC):
@@ -18,6 +20,7 @@ class BaseAdapter(ABC):
         thread_id: str,
         sender: str,
         raw_msg: dict,
+        on_chunk: Optional[StreamCallback] = None,
     ) -> Optional[str]:
         """Execute a prompt against the underlying agent and return its reply text."""
 

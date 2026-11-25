@@ -19,6 +19,7 @@ class HubConfig:
     max_replies_per_hour: int = 60
     agent_alive_timeout: int = 90
     recent_context_limit: int = 15
+    max_artifact_mb: int = 20
 
     @property
     def db_path(self) -> str:
@@ -27,6 +28,10 @@ class HubConfig:
     @property
     def admin_token_path(self) -> str:
         return str(Path(self.data_dir) / "admin.token")
+
+    @property
+    def artifacts_dir(self) -> str:
+        return str(Path(self.data_dir) / "artifacts")
 
     @classmethod
     def from_env(cls) -> "HubConfig":
@@ -43,6 +48,7 @@ class HubConfig:
             max_replies_per_hour=int(os.environ.get("AGENTLOOM_MAX_REPLIES_PER_HOUR", "60")),
             agent_alive_timeout=int(os.environ.get("AGENTLOOM_AGENT_TIMEOUT", "90")),
             recent_context_limit=int(os.environ.get("AGENTLOOM_CONTEXT_LIMIT", "15")),
+            max_artifact_mb=int(os.environ.get("AGENTLOOM_MAX_ARTIFACT_MB", "20")),
         )
 
     def resolve_admin_token(self) -> tuple[str, bool]:

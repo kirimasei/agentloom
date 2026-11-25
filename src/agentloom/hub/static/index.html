@@ -689,13 +689,106 @@ body {
   border-radius: 4px;
 }
 
-/* Working Placeholder Bubble */
+/* Working Placeholder Bubble & Streaming Preview */
 .working-bubble .msg-content {
   background: rgba(19, 25, 42, 0.65);
   border-style: dashed;
   border-left: 3px solid var(--node-color, var(--primary));
 }
 .working-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-soft); }
+.stream-preview {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(6, 9, 17, 0.72);
+  border: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: #cbd5e1;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.stream-cursor {
+  display: inline-block;
+  width: 7px; height: 13px;
+  background: var(--primary);
+  vertical-align: middle;
+  margin-left: 3px;
+  animation: blinkCursor 0.9s steps(2, start) infinite;
+}
+@keyframes blinkCursor { to { opacity: 0; } }
+
+/* Thread Artifacts & HITL Approvals */
+.thread-extras {
+  max-width: 780px;
+  width: 100%;
+  margin: 0 auto 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.thread-extras:empty { display: none; }
+.artifact-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: rgba(15, 21, 36, 0.78);
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+}
+.artifact-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 99px;
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.32);
+  color: #7dd3fc;
+  cursor: pointer;
+  font-size: 11.5px;
+  transition: background 0.15s;
+}
+.artifact-chip:hover { background: rgba(56, 189, 248, 0.22); }
+.artifact-size { color: var(--text-dim); font-size: 10.5px; }
+
+.approval-card {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.42);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.approval-info { flex: 1; min-width: 220px; }
+.approval-title { font-size: 12.5px; font-weight: 650; color: #fbbf24; }
+.approval-summary { font-size: 12px; color: var(--text-soft); margin-top: 3px; word-break: break-word; }
+.approval-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.approval-badge {
+  background: #ef4444;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 5px;
+  border-radius: 99px;
+  line-height: 15px;
+}
+.attach-btn {
+  height: 42px;
+  padding: 0 11px;
+  font-size: 15px;
+  border-radius: 10px;
+  flex-shrink: 0;
+}
 .typing-dots { display: inline-flex; gap: 3px; }
 .typing-dots i {
   width: 5px; height: 5px; border-radius: 50%;
@@ -984,6 +1077,23 @@ body {
   </div>
 </div>
 
+<div class="modal-backdrop hidden" id="approvalModal">
+  <div class="modal wide">
+    <div class="modal-head">
+      <h3>🛡️ 高危操作审批中心</h3>
+      <button class="icon-btn" onclick="closeApprovalModal()">关闭</button>
+    </div>
+    <p>当远端 Worker 命中高危规则或协作者发起敏感操作审批时，必须由管理员批准后才会继续执行。</p>
+    <div class="section-head">
+      <h2>审批队列</h2>
+      <button class="icon-btn" onclick="fetchApprovals(true)">刷新</button>
+    </div>
+    <div class="token-table" id="approvalModalList">
+      <div style="color:var(--text-dim);font-size:12px;">暂无审批记录</div>
+    </div>
+  </div>
+</div>
+
 <div class="app">
   <aside class="sidebar" id="sidebar">
     <div class="sidebar-header">
@@ -996,6 +1106,7 @@ body {
       </div>
       <div class="header-actions">
         <div class="conn-dot" id="connStatus" title="WebSocket 连接状态"></div>
+        <button class="icon-btn" id="approvalsBtn" style="display:none;" onclick="openApprovalModal()" title="高危操作审批">🛡️ <span class="approval-badge" id="approvalBadge" style="display:none;">0</span></button>
         <button class="icon-btn" id="tokensBtn" style="display:none;" onclick="openTokenModal()" title="管理凭证与邀请">🔑 凭证</button>
         <button class="icon-btn danger" onclick="logoutSecret()" title="退出并清除本地凭证">退出</button>
       </div>
@@ -1063,6 +1174,7 @@ body {
     </header>
 
     <div class="chat-messages" id="chatMessages">
+      <div class="thread-extras" id="threadExtras"></div>
       <div class="chat-stream" id="chatStream"></div>
     </div>
 
@@ -1072,6 +1184,8 @@ body {
       <div class="composer-inner">
         <div class="mention-dropdown" id="mentionDropdown"></div>
         <div class="chat-input">
+          <input type="file" id="artifactFileInput" style="display:none" onchange="handleArtifactFileSelect(event)">
+          <button type="button" class="icon-btn attach-btn" id="attachBtn" onclick="triggerArtifactUpload()" title="上传文件或构建产物到当前线程">📎</button>
           <textarea id="msgInput" rows="1" placeholder="输入指令… (@ 提及节点，Enter 发送)"></textarea>
           <button class="send-btn" id="sendBtn" onclick="sendMessage()">发送</button>
         </div>
@@ -1109,10 +1223,13 @@ let pendingNewThreadFromSelf = false;
 let threadLoadSeq = 0;
 let mentionStartPos = -1;
 let hubLatencyMs = null;
-let hubVersion = '0.1.0';
+let hubVersion = '0.2.0';
 let pulseTimers = {};
 let dynamicTemplates = [];
 let lastIssuedRecord = null;
+let streamBuffers = {};
+let currentThreadArtifacts = [];
+let allApprovals = [];
 const clientId = 'web-ui-' + Math.random().toString(36).slice(2, 8);
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -1216,6 +1333,8 @@ function updateSenderPill() {
 function updateRoleUI() {
   const isAdmin = !!(currentPrincipal && currentPrincipal.can_control);
   document.getElementById('tokensBtn').style.display = isAdmin ? 'inline-flex' : 'none';
+  document.getElementById('approvalsBtn').style.display = isAdmin ? 'inline-flex' : 'none';
+  updateApprovalBadge();
   updateSenderPill();
 }
 
@@ -1282,7 +1401,7 @@ async function verifyAndInit(candidate) {
     localStorage.setItem('agentloom_token', token);
     hideAuthModal();
     updateRoleUI();
-    await Promise.all([fetchAgents(), fetchThreads(), measureLatency()]);
+    await Promise.all([fetchAgents(), fetchThreads(), fetchApprovals(), measureLatency()]);
     connectWS();
     startTimers();
   } catch (e) {
@@ -1368,6 +1487,12 @@ function connectWS() {
       syncWorkingIndicator();
     } else if (msg.type === 'agent_status') {
       handleAgentStatus(msg);
+    } else if (msg.type === 'agent_stream') {
+      handleAgentStream(msg);
+    } else if (msg.type === 'artifact_added') {
+      handleArtifactAdded(msg.artifact);
+    } else if (msg.type === 'approval_created' || msg.type === 'approval_updated') {
+      handleApprovalEvent(msg);
     } else if (msg.type === 'thread_update') {
       handleThreadUpdate(msg.thread);
     } else if (msg.type === 'broadcast') {
@@ -1925,6 +2050,8 @@ async function selectThread(threadId) {
     if (seq !== threadLoadSeq) return;
 
     updateThreadHeader(data);
+    currentThreadArtifacts = Array.isArray(data.artifacts) ? data.artifacts : [];
+    renderThreadExtras();
     const stream = document.getElementById('chatStream');
     stream.innerHTML = '';
     hideNewMsgPill();
@@ -1939,6 +2066,8 @@ function startNewThread() {
   currentThread = null;
   currentThreadData = null;
   currentThreadClosed = false;
+  currentThreadArtifacts = [];
+  document.getElementById('threadExtras').innerHTML = '';
   document.getElementById('infoPopover').classList.remove('visible');
   hideNewMsgPill();
   clearWorkingBubbles();
@@ -1992,6 +2121,9 @@ function handleAgentStatus(msg) {
   agents[msg.agent].working = msg.state === 'working'
     ? { thread_id: msg.thread_id, detail: msg.detail || '', started_at: msg.timestamp || new Date().toISOString() }
     : null;
+  if (msg.state !== 'working') {
+    delete streamBuffers[msg.agent];
+  }
   if (msg.state === 'error') {
     showToast('error', `${msg.agent} 执行任务失败或超时`);
   }
@@ -2002,7 +2134,252 @@ function handleAgentStatus(msg) {
   syncWorkingIndicator();
 }
 
+function appendStreamChunk(agent, delta, streamId = '') {
+  if (!agent || !delta) return '';
+  const prev = streamBuffers[agent];
+  const nextText = (prev && prev.streamId === streamId) ? (prev.text + delta) : delta;
+  streamBuffers[agent] = { streamId, text: nextText.slice(-4000) };
+  return streamBuffers[agent].text;
+}
+
+function handleAgentStream(msg) {
+  if (!msg.agent || !msg.delta) return;
+  const fullText = appendStreamChunk(msg.agent, msg.delta, msg.stream_id || '');
+  if (!currentThread || (msg.thread_id && msg.thread_id !== currentThread)) return;
+
+  let bubble = document.querySelector(`.working-bubble[data-agent="${escapeAttr(msg.agent)}"]`);
+  if (!bubble) {
+    if (!agents[msg.agent]) agents[msg.agent] = { online: true, meta: {} };
+    agents[msg.agent].working = { thread_id: msg.thread_id, detail: 'Streaming...', started_at: msg.timestamp || new Date().toISOString() };
+    syncWorkingIndicator();
+    bubble = document.querySelector(`.working-bubble[data-agent="${escapeAttr(msg.agent)}"]`);
+  }
+  if (bubble) {
+    let pre = bubble.querySelector('.stream-preview');
+    if (!pre) {
+      pre = document.createElement('div');
+      pre.className = 'stream-preview';
+      bubble.querySelector('.msg-content').appendChild(pre);
+    }
+    pre.innerHTML = `${escapeHtml(fullText)}<span class="stream-cursor"></span>`;
+    pre.scrollTop = pre.scrollHeight;
+    const container = document.getElementById('chatMessages');
+    if ((container.scrollHeight - container.scrollTop - container.clientHeight) < 120) {
+      container.scrollTop = container.scrollHeight;
+    }
+  }
+}
+
+/* ── Artifacts & Approvals (V2) ───────────────────────────────────── */
+function formatBytes(n) {
+  const num = Number(n || 0);
+  if (num < 1024) return `${num} B`;
+  if (num < 1024 * 1024) return `${(num / 1024).toFixed(1)} KB`;
+  return `${(num / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function renderArtifactBarHtml(list) {
+  if (!Array.isArray(list) || list.length === 0) return '';
+  const chips = list.map(a => `
+    <button type="button" class="artifact-chip" onclick="downloadArtifact('${escapeAttr(a.id)}', '${escapeAttr(a.filename)}')" title="SHA256: ${escapeHtml(a.sha256 || '')}">
+      <span>📎 ${escapeHtml(a.filename)}</span>
+      <span class="artifact-size tabular">${escapeHtml(formatBytes(a.size_bytes))}</span>
+    </button>
+  `).join('');
+  return `<div class="artifact-bar"><span style="color:var(--text-dim);font-weight:600;">线程产物:</span>${chips}</div>`;
+}
+
+function renderApprovalCardsHtml(list, canDecide = false) {
+  const pending = (list || []).filter(a => a.status === 'pending');
+  if (!pending.length) return '';
+  return pending.map(a => `
+    <div class="approval-card">
+      <div class="approval-info">
+        <div class="approval-title">🛡️ 待审批 #${escapeHtml(a.id)} · ${escapeHtml(a.action)}</div>
+        <div class="approval-summary">发起: ${escapeHtml(a.requester)}${a.target_agent ? ` → @${escapeHtml(a.target_agent)}` : ''} · ${escapeHtml(a.summary)}</div>
+      </div>
+      ${canDecide ? `
+        <div class="approval-actions">
+          <button type="button" class="icon-btn primary" onclick="decideApproval('${escapeAttr(a.id)}', 'approved')">✅ 批准执行</button>
+          <button type="button" class="icon-btn danger" onclick="decideApproval('${escapeAttr(a.id)}', 'rejected')">✖ 拒绝</button>
+        </div>
+      ` : '<span class="badge-tag working">等待管理员审批</span>'}
+    </div>
+  `).join('');
+}
+
+function renderThreadExtras() {
+  const box = document.getElementById('threadExtras');
+  if (!box) return;
+  if (!currentThread) {
+    box.innerHTML = '';
+    return;
+  }
+  const canDecide = !!(currentPrincipal && currentPrincipal.can_control);
+  const threadApprovals = allApprovals.filter(a => a.thread_id === currentThread && a.status === 'pending');
+  box.innerHTML = renderApprovalCardsHtml(threadApprovals, canDecide) + renderArtifactBarHtml(currentThreadArtifacts);
+}
+
+function handleArtifactAdded(art) {
+  if (!art || !art.id) return;
+  if (currentThread && art.thread_id === currentThread) {
+    if (!currentThreadArtifacts.some(x => x.id === art.id)) {
+      currentThreadArtifacts.unshift(art);
+      renderThreadExtras();
+    }
+  }
+  showToast('info', `新附件: ${art.filename} (${formatBytes(art.size_bytes)})`);
+}
+
+function triggerArtifactUpload() {
+  document.getElementById('artifactFileInput').click();
+}
+
+function handleArtifactFileSelect(event) {
+  const file = event.target?.files?.[0];
+  if (!file) return;
+  event.target.value = '';
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const result = String(reader.result || '');
+    const b64 = result.includes(',') ? result.split(',', 2)[1] : result;
+    try {
+      const r = await apiFetch('/api/artifacts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: file.name,
+          content_base64: b64,
+          content_type: file.type || 'application/octet-stream',
+          thread_id: currentThread || null,
+        })
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        showToast('error', `上传失败: ${data.detail || r.status}`);
+        return;
+      }
+      showToast('info', `已上传 ${data.artifact.filename}`);
+    } catch (e) {
+      showToast('error', `上传异常: ${e.message}`);
+    }
+  };
+  reader.readAsDataURL(file);
+}
+
+async function downloadArtifact(id, filename) {
+  try {
+    const r = await apiFetch(`/api/artifacts/${encodeURIComponent(id)}/download`);
+    if (!r.ok) {
+      showToast('error', `下载失败: HTTP ${r.status}`);
+      return;
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || id;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } catch (e) {
+    showToast('error', `下载失败: ${e.message}`);
+  }
+}
+
+async function fetchApprovals(renderModal = false) {
+  try {
+    const r = await apiFetch('/api/approvals');
+    if (!r.ok) return;
+    const data = await r.json();
+    allApprovals = data.approvals || [];
+    updateApprovalBadge();
+    if (currentThread) renderThreadExtras();
+    if (renderModal) renderApprovalModal();
+  } catch (e) {}
+}
+
+function updateApprovalBadge() {
+  const badge = document.getElementById('approvalBadge');
+  if (!badge) return;
+  const count = allApprovals.filter(a => a.status === 'pending').length;
+  badge.textContent = String(count);
+  badge.style.display = count > 0 ? 'inline-block' : 'none';
+}
+
+function handleApprovalEvent(msg) {
+  const apr = msg.approval;
+  if (!apr || !apr.id) return;
+  const idx = allApprovals.findIndex(x => x.id === apr.id);
+  if (idx >= 0) allApprovals[idx] = apr;
+  else allApprovals.unshift(apr);
+  updateApprovalBadge();
+  if (currentThread && apr.thread_id === currentThread) renderThreadExtras();
+  if (!document.getElementById('approvalModal').classList.contains('hidden')) renderApprovalModal();
+  if (msg.type === 'approval_created') {
+    showToast('info', `待审批 #${apr.id}: ${apr.action}`);
+  }
+}
+
+function openApprovalModal() {
+  document.getElementById('approvalModal').classList.remove('hidden');
+  fetchApprovals(true);
+}
+
+function closeApprovalModal() {
+  document.getElementById('approvalModal').classList.add('hidden');
+}
+
+function renderApprovalModal() {
+  const box = document.getElementById('approvalModalList');
+  if (!allApprovals.length) {
+    box.innerHTML = '<div style="color:var(--text-dim);font-size:12px;">暂无审批记录</div>';
+    return;
+  }
+  const canDecide = !!(currentPrincipal && currentPrincipal.can_control);
+  box.innerHTML = allApprovals.map(a => `
+    <div class="token-row">
+      <div class="token-meta">
+        <div class="token-name">
+          #${escapeHtml(a.id)} · ${escapeHtml(a.action)}
+          <span class="badge-tag ${a.status === 'pending' ? 'working' : (a.status === 'rejected' ? 'closed' : '')}" style="margin-left:5px;">${escapeHtml(a.status)}</span>
+        </div>
+        <div class="token-sub">${escapeHtml(a.requester)}${a.target_agent ? ` → @${escapeHtml(a.target_agent)}` : ''} · ${escapeHtml(a.summary)}</div>
+      </div>
+      ${a.status === 'pending' && canDecide ? `
+        <div style="display:flex;gap:5px;flex-shrink:0;">
+          <button type="button" class="icon-btn primary" onclick="decideApproval('${escapeAttr(a.id)}', 'approved')">批准</button>
+          <button type="button" class="icon-btn danger" onclick="decideApproval('${escapeAttr(a.id)}', 'rejected')">拒绝</button>
+        </div>
+      ` : ''}
+    </div>
+  `).join('');
+}
+
+async function decideApproval(id, decision) {
+  try {
+    const r = await apiFetch(`/api/approvals/${encodeURIComponent(id)}/decide`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision })
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      showToast('error', data.detail || '审批操作失败');
+      return;
+    }
+    showToast('info', `已${decision === 'approved' ? '批准' : '拒绝'} #${id}`);
+    await fetchApprovals(!document.getElementById('approvalModal').classList.contains('hidden'));
+  } catch (e) {
+    showToast('error', e.message);
+  }
+}
+
 function handleBroadcast(msg) {
+  if (msg.sender && msg.sender !== 'system') {
+    delete streamBuffers[msg.sender];
+  }
   const prof = getNodeProfile(msg.sender, msg.role || inferFallbackRole(msg.sender));
   if (msg.sender && msg.sender !== 'system') {
     pulseNodeLink(msg.sender, prof.color);
@@ -2060,9 +2437,14 @@ function syncWorkingIndicator() {
     const startedMs = info.working.started_at ? new Date(info.working.started_at).getTime() : Date.now();
     const el = document.createElement('div');
     el.className = 'message agent working-bubble';
+    el.dataset.agent = name;
     el.style.setProperty('--node-color', prof.color);
     el.style.setProperty('--node-bg', prof.bg);
     el.style.setProperty('--node-border', prof.border);
+    const cachedStream = streamBuffers[name]?.text || '';
+    const streamHtml = cachedStream
+      ? `<div class="stream-preview">${escapeHtml(cachedStream)}<span class="stream-cursor"></span></div>`
+      : '';
     el.innerHTML = `
       <div class="msg-avatar">${escapeHtml(prof.mono)}</div>
       <div class="msg-content">
@@ -2075,6 +2457,7 @@ function syncWorkingIndicator() {
           <span>正在执行…</span>
           <span class="working-timer tabular" data-start="${startedMs}">0s</span>
         </div>
+        ${streamHtml}
       </div>
     `;
     stream.appendChild(el);

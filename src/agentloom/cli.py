@@ -64,6 +64,7 @@ def _cmd_worker(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     capabilities = [c.strip() for c in (args.capabilities or "").split(",") if c.strip()]
+    approval_patterns = [p.strip() for p in (args.require_approval_patterns or "").split(",") if p.strip()]
     adapter = create_adapter(
         args.adapter,
         api_url=args.api_url,
@@ -86,6 +87,8 @@ def _cmd_worker(args: argparse.Namespace) -> None:
         color=args.color,
         mono=args.mono,
         capabilities=capabilities,
+        approval_patterns=approval_patterns,
+        approval_timeout=args.approval_timeout,
         timeout=args.timeout,
         max_concurrent=args.max_concurrent,
         dry_run=args.dry_run,
@@ -200,6 +203,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker.add_argument("--color", default="", help="Preferred UI hex color (e.g. #818cf8)")
     p_worker.add_argument("--mono", default="", help="2-char monogram badge for UI")
     p_worker.add_argument("--capabilities", default="", help="Comma-separated capability tags")
+    p_worker.add_argument(
+        "--require-approval-patterns",
+        default="",
+        help="Comma-separated keywords/regex requiring admin approval before execution",
+    )
+    p_worker.add_argument("--approval-timeout", type=int, default=180, help="Approval wait timeout in seconds")
     p_worker.add_argument("--timeout", type=int, default=300, help="Execution timeout in seconds")
     p_worker.add_argument("--max-concurrent", type=int, default=1, help="Max concurrent tasks")
     p_worker.add_argument("--dry-run", action="store_true", help="Echo received prompts without invoking backend")

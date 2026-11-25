@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from collections import defaultdict
@@ -33,6 +37,12 @@ from agentloom.protocol import (
 
 log = logging.getLogger("agentloom.hub")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def sanitize_filename(name: str) -> str:
+    base = os.path.basename((name or "").replace("\\", "/")).strip()
+    cleaned = re.sub(r"[\x00-\x1f\x7f<>:\"/\\|?*]+", "_", base).strip(". ")
+    return (cleaned or "artifact.bin")[:120]
 
 
 class AgentStats:
@@ -150,6 +160,27 @@ class CreateTokenRequest(BaseModel):
     allowed_agents: list[str] = ["*"]
 
 
+class ArtifactUploadRequest(BaseModel):
+    filename: str
+    content_base64: Optional[str] = None
+    content_text: Optional[str] = None
+    thread_id: Optional[str] = None
+    content_type: str = "application/octet-stream"
+
+
+class CreateApprovalRequest(BaseModel):
+    action: str
+    summary: str
+    thread_id: Optional[str] = None
+    target_agent: str = ""
+    payload: Optional[dict] = None
+
+
+class DecideApprovalRequest(BaseModel):
+    decision: str
+    note: str = ""
+
+
 class HubState:
     def __init__(self, cfg: HubConfig):
         self.cfg = cfg
@@ -162,6 +193,8 @@ class HubState:
         self.ws_token_ids: dict[WebSocket, str] = {}
         self.threads: dict[str, Thread] = {}
         self.thread_waiters: dict[str, list[asyncio.Event]] = defaultdict(list)
+        self.approval_waiters: dict[str, list[asyncio.Event]] = defaultdict(list)
+        self.approval_worker_requests: dict[str, tuple[str, str]] = {}
 
     @property
     def auth(self) -> AuthManager:
@@ -241,6 +274,33 @@ class HubState:
     def notify_thread_waiters(self, thread_id: str) -> None:
         for ev in list(self.thread_waiters.get(thread_id, [])):
             ev.set()
+
+    def notify_approval_waiters(self, approval_id: str) -> None:
+        for ev in list(self.approval_waiters.get(approval_id, [])):
+            ev.set()
+
+    def can_view_artifact(self, principal: Principal, artifact: dict) -> bool:
+        if principal.is_admin or "*" in principal.allowed_agents:
+            return True
+        tid = artifact.get("thread_id")
+        if tid:
+            t = self.threads.get(tid)
+            return bool(t and self.can_view_thread(principal, t))
+        return principal.name == artifact.get("uploader")
+
+    def can_view_approval(self, principal: Principal, approval: dict) -> bool:
+        if principal.is_admin or "*" in principal.allowed_agents:
+            return True
+        target_agent = (approval.get("target_agent") or "").strip()
+        if target_agent and not principal.can_access_agent(target_agent):
+            return False
+        tid = approval.get("thread_id")
+        if tid:
+            t = self.threads.get(tid)
+            return bool(t and self.can_view_thread(principal, t))
+        return principal.name == approval.get("requester") or (
+            bool(target_agent) and principal.can_access_agent(target_agent)
+        )
 
     async def save_thread(self, thread: Thread) -> None:
         await self.db.run(self.db.save_thread_sync, thread.snapshot_tuple())
@@ -329,20 +389,21 @@ class HubState:
         thread_id: Optional[str] = None,
         role: Optional[str] = None,
         thread: Optional[Thread] = None,
+        stream_id: Optional[str] = None,
     ) -> None:
         target_thread = thread or (self.threads.get(thread_id) if thread_id else None)
-        await self.send_to_agents_and_humans(
-            {
-                "type": "broadcast",
-                "sender": sender,
-                "role": role or infer_role(sender),
-                "content": content,
-                "mentions": mentions,
-                "thread_id": thread_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            },
-            thread=target_thread,
-        )
+        payload = {
+            "type": "broadcast",
+            "sender": sender,
+            "role": role or infer_role(sender),
+            "content": content,
+            "mentions": mentions,
+            "thread_id": thread_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if stream_id:
+            payload["stream_id"] = stream_id
+        await self.send_to_agents_and_humans(payload, thread=target_thread)
 
     async def broadcast_thread_update(self, thread: Thread) -> None:
         await self.send_to_agents_and_humans(
@@ -509,7 +570,15 @@ class HubState:
             self.agents[sender]["stats"].record_reply()
         await self.save_thread_and_message(thread, msg_obj)
 
-        await self.broadcast_message(sender, content, mentions, thread_id, role="agent", thread=thread)
+        await self.broadcast_message(
+            sender,
+            content,
+            mentions,
+            thread_id,
+            role="agent",
+            thread=thread,
+            stream_id=msg.get("stream_id"),
+        )
         await self.broadcast_thread_update(thread)
         self.notify_thread_waiters(thread_id)
 
@@ -568,6 +637,9 @@ def create_app(config: Optional[HubConfig] = None) -> FastAPI:
 
     os.makedirs(STATIC_DIR, exist_ok=True)
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    async def require_authenticated(request: Request) -> Principal:
+        return await state.auth.require_authenticated(request)
 
     async def require_operator(request: Request) -> Principal:
         return await state.auth.require_operator(request)
@@ -687,7 +759,8 @@ def create_app(config: Optional[HubConfig] = None) -> FastAPI:
             msgs = t.messages[max(0, since_index) :]
         else:
             msgs = t.messages[-limit:]
-        return {**t.to_dict(), "messages": msgs}
+        artifacts = await state.db.run(state.db.list_artifacts_sync, thread_id)
+        return {**t.to_dict(), "messages": msgs, "artifacts": artifacts}
 
     @app.patch("/api/threads/{thread_id}")
     async def rename_thread(
@@ -787,6 +860,252 @@ def create_app(config: Optional[HubConfig] = None) -> FastAPI:
             "message_index": message_index,
             "replies": replies,
         }
+
+    # ── Artifacts Transfer ────────────────────────────────────────────
+    @app.post("/api/artifacts")
+    async def upload_artifact(
+        req: ArtifactUploadRequest,
+        principal: Principal = Depends(require_authenticated),
+    ):
+        clean_name = sanitize_filename(req.filename)
+        tid = (req.thread_id or "").strip() or None
+        target_thread: Optional[Thread] = None
+        if tid:
+            target_thread = state.threads.get(tid)
+            if not target_thread:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            if principal.is_operator and not state.can_view_thread(principal, target_thread):
+                raise HTTPException(status_code=403, detail="Thread outside token ACL scope")
+
+        if req.content_base64 is not None:
+            try:
+                raw_bytes = base64.b64decode(req.content_base64.encode("ascii"), validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {exc}")
+        elif req.content_text is not None:
+            raw_bytes = req.content_text.encode("utf-8")
+        else:
+            raise HTTPException(status_code=400, detail="Either content_base64 or content_text is required")
+
+        max_bytes = state.cfg.max_artifact_mb * 1024 * 1024
+        if len(raw_bytes) > max_bytes:
+            raise HTTPException(status_code=413, detail=f"Artifact exceeds {state.cfg.max_artifact_mb} MB limit")
+
+        artifact_id = f"art_{int(time.time())}_{secrets.token_hex(4)}"
+        sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        os.makedirs(state.cfg.artifacts_dir, exist_ok=True)
+        disk_path = os.path.join(state.cfg.artifacts_dir, artifact_id)
+        with open(disk_path, "wb") as f:
+            f.write(raw_bytes)
+
+        meta = await state.db.run(
+            state.db.insert_artifact_sync,
+            artifact_id,
+            tid,
+            principal.name,
+            clean_name,
+            (req.content_type or "application/octet-stream")[:120],
+            len(raw_bytes),
+            sha256,
+        )
+        await state.send_to_agents_and_humans(
+            {"type": "artifact_added", "artifact": meta},
+            thread=target_thread,
+        )
+        if target_thread:
+            await state.broadcast_message(
+                "system",
+                f"[附件] {principal.name} 上传了 {clean_name} ({len(raw_bytes)} B)",
+                [],
+                tid,
+                role="system",
+                thread=target_thread,
+            )
+        return {"ok": True, "artifact": meta}
+
+    @app.get("/api/artifacts")
+    async def list_artifacts(
+        thread_id: Optional[str] = None,
+        principal: Principal = Depends(require_operator),
+    ):
+        tid = (thread_id or "").strip() or None
+        if tid:
+            t = state.threads.get(tid)
+            if not t:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            if not state.can_view_thread(principal, t):
+                raise HTTPException(status_code=403, detail="Thread outside token ACL scope")
+        rows = await state.db.run(state.db.list_artifacts_sync, tid)
+        visible = [a for a in rows if state.can_view_artifact(principal, a)]
+        return {"artifacts": visible}
+
+    @app.get("/api/artifacts/{artifact_id}")
+    async def get_artifact_meta(
+        artifact_id: str,
+        principal: Principal = Depends(require_authenticated),
+    ):
+        art = await state.db.run(state.db.get_artifact_sync, artifact_id)
+        if not art:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        if not principal.is_worker or principal.is_operator:
+            if not state.can_view_artifact(principal, art):
+                raise HTTPException(status_code=403, detail="Artifact outside token ACL scope")
+        return art
+
+    @app.get("/api/artifacts/{artifact_id}/download")
+    async def download_artifact(
+        artifact_id: str,
+        principal: Principal = Depends(require_authenticated),
+    ):
+        art = await state.db.run(state.db.get_artifact_sync, artifact_id)
+        if not art:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        if principal.role == "operator" and not state.can_view_artifact(principal, art):
+            raise HTTPException(status_code=403, detail="Artifact outside token ACL scope")
+        disk_path = os.path.join(state.cfg.artifacts_dir, artifact_id)
+        if not os.path.isfile(disk_path):
+            raise HTTPException(status_code=404, detail="Artifact file missing on disk")
+        return FileResponse(
+            disk_path,
+            media_type="application/octet-stream",
+            filename=art["filename"],
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
+
+    # ── Human-in-the-Loop Approvals ───────────────────────────────────
+    @app.post("/api/approvals")
+    async def create_approval(
+        req: CreateApprovalRequest,
+        principal: Principal = Depends(require_operator),
+    ):
+        tid = (req.thread_id or "").strip() or None
+        target_thread: Optional[Thread] = None
+        if tid:
+            target_thread = state.threads.get(tid)
+            if not target_thread:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            if not state.can_view_thread(principal, target_thread):
+                raise HTTPException(status_code=403, detail="Thread outside token ACL scope")
+        target_agent = (req.target_agent or "").strip()
+        if target_agent and not principal.can_access_agent(target_agent):
+            raise HTTPException(status_code=403, detail=f"Node '{target_agent}' outside token ACL scope")
+
+        approval_id = f"apr_{int(time.time())}_{secrets.token_hex(4)}"
+        record = await state.db.run(
+            state.db.insert_approval_sync,
+            approval_id,
+            tid,
+            principal.name,
+            target_agent,
+            req.action.strip()[:80],
+            req.summary.strip()[:500],
+            req.payload or {},
+        )
+        await state.send_to_agents_and_humans(
+            {"type": "approval_created", "approval": record},
+            thread=target_thread,
+            agent_scope=target_agent or None,
+        )
+        if target_thread:
+            await state.broadcast_message(
+                "system",
+                f"[待审批 #{approval_id}] {principal.name} 请求执行 {record['action']}：{record['summary']}",
+                [],
+                tid,
+                role="system",
+                thread=target_thread,
+            )
+        return {"ok": True, "approval": record}
+
+    @app.get("/api/approvals")
+    async def list_approvals(
+        status: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        principal: Principal = Depends(require_operator),
+    ):
+        rows = await state.db.run(state.db.list_approvals_sync, status, thread_id)
+        visible = [a for a in rows if state.can_view_approval(principal, a)]
+        return {"approvals": visible}
+
+    @app.get("/api/approvals/{approval_id}")
+    async def get_approval(
+        approval_id: str,
+        principal: Principal = Depends(require_operator),
+    ):
+        record = await state.db.run(state.db.get_approval_sync, approval_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="Approval not found")
+        if not state.can_view_approval(principal, record):
+            raise HTTPException(status_code=403, detail="Approval outside token ACL scope")
+        return record
+
+    @app.post("/api/approvals/{approval_id}/decide")
+    async def decide_approval(
+        approval_id: str,
+        req: DecideApprovalRequest,
+        admin: Principal = Depends(require_admin),
+    ):
+        decision = (req.decision or "").strip().lower()
+        if decision not in ("approved", "rejected"):
+            raise HTTPException(status_code=400, detail="decision must be 'approved' or 'rejected'")
+        existing = await state.db.run(state.db.get_approval_sync, approval_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Approval not found")
+        if existing["status"] != "pending":
+            raise HTTPException(status_code=409, detail=f"Approval already {existing['status']}")
+
+        updated = await state.db.run(
+            state.db.decide_approval_sync,
+            approval_id,
+            decision,
+            admin.name,
+            (req.note or "").strip()[:300],
+        )
+        if not updated:
+            raise HTTPException(status_code=409, detail="Approval could not be updated")
+
+        state.notify_approval_waiters(approval_id)
+        worker_meta = state.approval_worker_requests.pop(approval_id, None)
+        if worker_meta:
+            target_worker, req_id = worker_meta
+            ws = state.get_agent_ws(target_worker)
+            if ws:
+                try:
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "approval_decision",
+                                "approval_id": approval_id,
+                                "request_id": req_id,
+                                "decision": decision,
+                                "decided_by": admin.name,
+                                "note": updated["decision_note"],
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                except Exception as exc:
+                    log.warning(f"Failed notifying worker {target_worker} of approval {approval_id}: {exc}")
+
+        tid = updated.get("thread_id")
+        target_thread = state.threads.get(tid) if tid else None
+        await state.send_to_agents_and_humans(
+            {"type": "approval_updated", "approval": updated},
+            thread=target_thread,
+            agent_scope=(updated.get("target_agent") or None),
+        )
+        if target_thread:
+            label = "已批准" if decision == "approved" else "已拒绝"
+            note_suffix = f"（备注：{updated['decision_note']}）" if updated["decision_note"] else ""
+            await state.broadcast_message(
+                "system",
+                f"[审批{label} #{approval_id}] {admin.name} {label} {updated['action']}{note_suffix}",
+                [],
+                tid,
+                role="system",
+                thread=target_thread,
+            )
+        return {"ok": True, "approval": updated}
 
     # ── WebSocket Endpoint ────────────────────────────────────────────
     @app.websocket("/ws")
@@ -903,6 +1222,78 @@ def create_app(config: Optional[HubConfig] = None) -> FastAPI:
                         },
                         agent_scope=agent_name,
                     )
+                    continue
+
+                if msg_type == "stream_chunk" and role != "human" and agent_name:
+                    delta = str(msg.get("delta") or "")[:4000]
+                    if not delta:
+                        continue
+                    tid = msg.get("thread_id")
+                    stream_id = (msg.get("stream_id") or "").strip()
+                    seq = int(msg.get("seq") or 0)
+                    if agent_name in state.agents and state.agents[agent_name].get("working"):
+                        prev = state.agents[agent_name]["working"].get("preview", "")
+                        state.agents[agent_name]["working"]["preview"] = (prev + delta)[-2000:]
+                    target_thread = state.threads.get(tid) if tid else None
+                    await state.send_to_agents_and_humans(
+                        {
+                            "type": "agent_stream",
+                            "agent": agent_name,
+                            "stream_id": stream_id,
+                            "thread_id": tid,
+                            "delta": delta,
+                            "seq": seq,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        },
+                        thread=target_thread,
+                        agent_scope=agent_name,
+                    )
+                    continue
+
+                if msg_type == "approval_request" and role != "human" and agent_name:
+                    tid = (msg.get("thread_id") or "").strip() or None
+                    req_id = (msg.get("request_id") or "").strip()
+                    action = (msg.get("action") or "high-risk-action").strip()[:80]
+                    summary = (msg.get("summary") or "").strip()[:500]
+                    payload_obj = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
+                    approval_id = f"apr_{int(time.time())}_{secrets.token_hex(4)}"
+                    record = await state.db.run(
+                        state.db.insert_approval_sync,
+                        approval_id,
+                        tid,
+                        agent_name,
+                        agent_name,
+                        action,
+                        summary,
+                        payload_obj,
+                    )
+                    state.approval_worker_requests[approval_id] = (agent_name, req_id)
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "approval_registered",
+                                "approval_id": approval_id,
+                                "request_id": req_id,
+                                "status": "pending",
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    target_thread = state.threads.get(tid) if tid else None
+                    await state.send_to_agents_and_humans(
+                        {"type": "approval_created", "approval": record},
+                        thread=target_thread,
+                        agent_scope=agent_name,
+                    )
+                    if target_thread:
+                        await state.broadcast_message(
+                            "system",
+                            f"[需管理员审批 #{approval_id}] @{agent_name} 触发高危策略（{action}）：{summary}",
+                            [],
+                            tid,
+                            role="system",
+                            thread=target_thread,
+                        )
                     continue
 
                 if msg_type == "message":

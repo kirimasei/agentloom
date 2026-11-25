@@ -1,12 +1,13 @@
-"""Unified outbound WebSocket WorkerRunner for AgentLoom."""
+"""Unified outbound WebSocket WorkerRunner for AgentLoom with streaming and HITL approval gates."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
+import secrets
 import signal
+import time
 from typing import Optional
 
 import websockets
@@ -31,6 +32,8 @@ class WorkerRunner:
         color: str = "",
         mono: str = "",
         capabilities: Optional[list[str]] = None,
+        approval_patterns: Optional[list[str]] = None,
+        approval_timeout: int = 180,
         timeout: int = 300,
         max_concurrent: int = 1,
         dry_run: bool = False,
@@ -44,6 +47,8 @@ class WorkerRunner:
         self.color = color.strip()
         self.mono = mono.strip()[:2].upper()
         self.capabilities = [c.strip() for c in (capabilities or []) if c.strip()]
+        self.approval_patterns = [p.strip() for p in (approval_patterns or []) if p and p.strip()]
+        self.approval_timeout = approval_timeout
         self.timeout = timeout
         self.dry_run = dry_run
 
@@ -56,6 +61,8 @@ class WorkerRunner:
         self._was_replaced = False
         self._restart_requested = False
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self._pending_approvals: dict[str, asyncio.Future] = {}
+        self._approval_ids: dict[str, str] = {}
 
     def stop(self) -> None:
         self._running = False
@@ -71,7 +78,20 @@ class WorkerRunner:
             meta["mono"] = self.mono
         if self.capabilities:
             meta["capabilities"] = self.capabilities
+        if self.approval_patterns:
+            meta["approval_gated"] = True
         return meta
+
+    def _match_approval_pattern(self, content: str) -> Optional[str]:
+        text = content or ""
+        for pat in self.approval_patterns:
+            try:
+                if re.search(pat, text, re.IGNORECASE):
+                    return pat
+            except re.error:
+                if pat.lower() in text.lower():
+                    return pat
+        return None
 
     async def connect(self, register_signals: bool = True) -> None:
         if register_signals:
@@ -205,8 +225,28 @@ class WorkerRunner:
                 msg = json.loads(data)
                 msg_type = msg.get("type")
 
-                if msg_type in ("heartbeat_ack", "agents_update", "broadcast", "thread_update", "agent_status"):
+                if msg_type in (
+                    "heartbeat_ack",
+                    "agents_update",
+                    "broadcast",
+                    "thread_update",
+                    "agent_status",
+                    "agent_stream",
+                    "artifact_added",
+                    "approval_created",
+                    "approval_updated",
+                ):
                     continue
+                elif msg_type == "approval_registered":
+                    req_id = msg.get("request_id") or ""
+                    apr_id = msg.get("approval_id") or ""
+                    if req_id and apr_id:
+                        self._approval_ids[req_id] = apr_id
+                elif msg_type == "approval_decision":
+                    req_id = msg.get("request_id") or ""
+                    fut = self._pending_approvals.get(req_id)
+                    if fut and not fut.done():
+                        fut.set_result(msg)
                 elif msg_type == "message_for_you":
                     asyncio.create_task(self.process_message(msg))
                 elif msg_type == "control":
@@ -223,6 +263,51 @@ class WorkerRunner:
             except Exception as exc:
                 log.error(f"Message loop error: {exc}")
                 await asyncio.sleep(1)
+
+    async def _request_approval_and_wait(
+        self,
+        thread_id: str,
+        sender: str,
+        matched_pattern: str,
+        content: str,
+    ) -> tuple[bool, str]:
+        req_id = f"req_{secrets.token_hex(4)}"
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_approvals[req_id] = fut
+        try:
+            sent = await self.send_json(
+                {
+                    "type": "approval_request",
+                    "request_id": req_id,
+                    "thread_id": thread_id,
+                    "action": f"pattern:{matched_pattern}",
+                    "summary": f"Message from {sender} matched approval rule '{matched_pattern}': {content[:240]}",
+                    "payload": {"pattern": matched_pattern, "sender": sender},
+                }
+            )
+            if not sent:
+                return False, "Cannot submit approval request while disconnected."
+
+            decision_msg = await asyncio.wait_for(fut, timeout=self.approval_timeout)
+            apr_id = decision_msg.get("approval_id") or self._approval_ids.get(req_id, "")
+            decision = decision_msg.get("decision")
+            note = (decision_msg.get("note") or "").strip()
+            decided_by = decision_msg.get("decided_by") or "admin"
+            if decision == "approved":
+                return True, f"Approved ({apr_id}) by {decided_by}"
+            return False, (
+                f"[审批被拒绝 #{apr_id}] 管理员 {decided_by} 拒绝执行命中高危规则 `{matched_pattern}` 的任务"
+                + (f"：{note}" if note else "。")
+            )
+        except asyncio.TimeoutError:
+            apr_id = self._approval_ids.get(req_id, "")
+            return False, (
+                f"[审批超时 #{apr_id}] 命中高危规则 `{matched_pattern}` 的任务在 {self.approval_timeout}s 内未获管理员批准，已取消执行。"
+            )
+        finally:
+            self._pending_approvals.pop(req_id, None)
+            self._approval_ids.pop(req_id, None)
 
     def build_prompt(self, msg: dict) -> str:
         sender = msg.get("sender", "user")
@@ -252,15 +337,73 @@ class WorkerRunner:
         async with self.semaphore:
             thread_id = msg.get("thread_id", "")
             sender = msg.get("sender", "user")
+            content = msg.get("content", "")
             prompt = self.build_prompt(msg)
             had_error = False
+            stream_id = f"str_{secrets.token_hex(4)}"
+
+            matched_pat = self._match_approval_pattern(content)
+            if matched_pat:
+                await self.send_status("working", thread_id, f"Waiting approval ({matched_pat})...")
+                approved, approval_note = await self._request_approval_and_wait(
+                    thread_id, sender, matched_pat, content
+                )
+                if not approved:
+                    await self.send_json(
+                        {
+                            "type": "reply",
+                            "thread_id": thread_id,
+                            "content": approval_note,
+                            "mentions": [],
+                        }
+                    )
+                    await self.send_status("idle", thread_id)
+                    return
+
             await self.send_status("working", thread_id, "Running...")
+
+            stream_buf: list[str] = []
+            last_flush = 0.0
+            seq_num = 0
+
+            async def _flush_stream() -> None:
+                nonlocal last_flush, seq_num
+                if not stream_buf:
+                    return
+                chunk_text = "".join(stream_buf)
+                stream_buf.clear()
+                last_flush = time.monotonic()
+                seq_num += 1
+                await self.send_json(
+                    {
+                        "type": "stream_chunk",
+                        "stream_id": stream_id,
+                        "thread_id": thread_id,
+                        "delta": chunk_text,
+                        "seq": seq_num,
+                    }
+                )
+
+            async def on_chunk(delta: str) -> None:
+                if not delta:
+                    return
+                stream_buf.append(delta)
+                buffered_len = sum(len(x) for x in stream_buf)
+                if buffered_len >= 32 or (time.monotonic() - last_flush) >= 0.05:
+                    await _flush_stream()
 
             try:
                 if self.dry_run:
                     reply = f"[DRY RUN @ {self.name}] received message from {sender}"
                 else:
-                    reply = await self.adapter.invoke(prompt, thread_id, sender, msg)
+                    reply = await self.adapter.invoke(
+                        prompt,
+                        thread_id,
+                        sender,
+                        msg,
+                        on_chunk=on_chunk,
+                    )
+                    await _flush_stream()
                     if not reply:
                         reply = f"[Error] {self.name} failed or timed out (>{self.timeout}s)"
                         had_error = True
@@ -271,7 +414,6 @@ class WorkerRunner:
 
                 new_mentions = extract_mentions(reply, exclude=self.name)
 
-                # Wait up to 10s if WS is mid-reconnect
                 if not (self.ws and self.connected):
                     for _ in range(20):
                         if self.ws and self.connected:
@@ -282,6 +424,7 @@ class WorkerRunner:
                     {
                         "type": "reply",
                         "thread_id": thread_id,
+                        "stream_id": stream_id,
                         "content": reply,
                         "mentions": new_mentions,
                     }
