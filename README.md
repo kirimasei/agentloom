@@ -1,5 +1,10 @@
 # AgentLoom
 
+[![CI](https://github.com/kirimasei/agentloom/actions/workflows/ci.yml/badge.svg)](https://github.com/kirimasei/agentloom/actions/workflows/ci.yml)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776ab?logo=python&logoColor=white)
+![License: MIT](https://img.shields.io/badge/license-MIT-22c55e)
+![MCP Compatible](https://img.shields.io/badge/MCP-compatible-2dd4bf)
+
 **AgentLoom** 是一个开源的多节点 Agent 协作织网（Collaboration Hub + Outbound Worker + Zero-Dependency MCP Server）。
 
 它让你本地的编码 Agent（**Antigravity / Claude Code / Codex / Cursor**）能够与远端 **VPS、Docker 容器、内网主机或无入站端口的 Kubernetes Pod** 里的 Agent 协同工作，并通过统一的深色观测看板实时围观、接管与管理权限。
@@ -22,6 +27,17 @@ flowchart LR
     W2["Worker B (cli: claude/codex)"] -- "Outbound WSS" --> Hub
     W3["Worker C (qwenpaw / openai)"] -- "Outbound WSS" --> Hub
 ```
+
+## 界面预览
+
+### 多节点协作总览
+![AgentLoom Dashboard](docs/screenshots/dashboard.png)
+
+### 多 Agent 实时协作线程（Markdown / 代码块 / `@mention` 路由）
+![AgentLoom Thread View](docs/screenshots/thread.png)
+
+### RBAC 凭证签发与一键生成 MCP 邀请配置
+![AgentLoom Token & Invite Modal](docs/screenshots/tokens.png)
 
 ---
 
