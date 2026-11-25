@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import mimetypes
 import os
 import sys
 import urllib.error
@@ -13,7 +16,7 @@ import urllib.request
 from typing import Optional
 
 from agentloom import __version__
-from agentloom.protocol import build_mcp_config_snippet, to_http_url
+from agentloom.protocol import build_mcp_config_snippet, sanitize_artifact_filename, to_http_url
 
 
 def _cmd_hub(args: argparse.Namespace) -> None:
@@ -104,6 +107,8 @@ def _cmd_worker(args: argparse.Namespace) -> None:
         max_concurrent=args.max_concurrent,
         dry_run=args.dry_run,
         verbose=args.verbose,
+        max_artifact_mb=args.max_artifact_mb,
+        artifact_inbox_dir=args.artifact_inbox_dir,
     )
     asyncio.run(runner.connect())
 
@@ -176,6 +181,83 @@ def _cmd_token(args: argparse.Namespace) -> None:
     print(json.dumps(res, ensure_ascii=False, indent=2))
 
 
+def _resolve_cli_token(args: argparse.Namespace) -> str:
+    tok = (getattr(args, "token", "") or os.environ.get("AGENTLOOM_TOKEN") or "").strip()
+    token_file = getattr(args, "token_file", "") or ""
+    if not tok and token_file and os.path.isfile(token_file):
+        with open(token_file, "r", encoding="utf-8") as f:
+            tok = f.read().strip()
+    if not tok:
+        print("[agentloom] Token required via --token, --token-file, or AGENTLOOM_TOKEN", file=sys.stderr)
+        sys.exit(1)
+    return tok
+
+
+def _cmd_artifact(args: argparse.Namespace) -> None:
+    raw_url = (getattr(args, "url", None) or os.environ.get("AGENTLOOM_URL") or "").strip()
+    if not raw_url:
+        print("[agentloom] Hub URL required via --url or AGENTLOOM_URL", file=sys.stderr)
+        sys.exit(1)
+    base_url = to_http_url(raw_url)
+    token = _resolve_cli_token(args)
+
+    if args.artifact_action == "upload":
+        fpath = os.path.abspath(os.path.expanduser(args.file_path))
+        if not os.path.isfile(fpath):
+            print(f"[agentloom] File not found: {fpath}", file=sys.stderr)
+            sys.exit(1)
+        filename = sanitize_artifact_filename(args.filename or os.path.basename(fpath))
+        mime_type, _ = mimetypes.guess_type(filename)
+        with open(fpath, "rb") as f:
+            raw_bytes = f.read()
+        body = {
+            "filename": filename,
+            "content_base64": base64.b64encode(raw_bytes).decode("ascii"),
+            "thread_id": (args.thread_id or "").strip() or None,
+            "content_type": mime_type or "application/octet-stream",
+        }
+        res = _http_json("POST", f"{base_url}/api/artifacts", token, body=body)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+    elif args.artifact_action == "list":
+        tid = (args.thread_id or "").strip()
+        qs = f"?thread_id={urllib.request.quote(tid)}" if tid else ""
+        res = _http_json("GET", f"{base_url}/api/artifacts{qs}", token)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+    elif args.artifact_action == "download":
+        aid = args.artifact_id.strip()
+        meta = _http_json("GET", f"{base_url}/api/artifacts/{aid}", token)
+        req = urllib.request.Request(
+            f"{base_url}/api/artifacts/{aid}/download",
+            headers={"X-Token": token, "User-Agent": f"agentloom-cli/{__version__}"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw_bytes = resp.read()
+        sha = hashlib.sha256(raw_bytes).hexdigest()
+        out_path = args.output or sanitize_artifact_filename(meta.get("filename") or f"{aid}.bin")
+        out_abs = os.path.abspath(out_path)
+        os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+        with open(out_abs, "wb") as f:
+            f.write(raw_bytes)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "artifact_id": aid,
+                    "filename": meta.get("filename"),
+                    "save_path": out_abs,
+                    "size_bytes": len(raw_bytes),
+                    "sha256": sha,
+                    "sha256_match": sha == meta.get("sha256"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        raise ValueError(f"Unsupported artifact action: {args.artifact_action}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentloom", description="AgentLoom multi-agent collaboration suite")
     parser.add_argument("--version", action="version", version=f"agentloom {__version__}")
@@ -224,6 +306,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_worker.add_argument("--max-concurrent", type=int, default=1, help="Max concurrent tasks")
     p_worker.add_argument("--dry-run", action="store_true", help="Echo received prompts without invoking backend")
     p_worker.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    p_worker.add_argument("--max-artifact-mb", type=int, default=10, help="Max artifact size (MB) for worker bridge")
+    p_worker.add_argument("--artifact-inbox-dir", default=None, help="Directory for auto-downloaded thread artifacts")
     p_worker.set_defaults(func=_cmd_worker)
 
     # mcp
@@ -259,6 +343,28 @@ def build_parser() -> argparse.ArgumentParser:
     tok_revoke = tok_sub.add_parser("revoke", help="Revoke a token by ID")
     tok_revoke.add_argument("token_id", help="Token ID to revoke")
     tok_revoke.set_defaults(func=_cmd_token)
+
+    # artifact
+    p_art = sub.add_parser("artifact", help="Upload, list, or download Hub artifacts")
+    p_art.add_argument("--url", default=None, help="Hub HTTP URL (or AGENTLOOM_URL)")
+    p_art.add_argument("--token", default="", help="Access token (or AGENTLOOM_TOKEN)")
+    p_art.add_argument("--token-file", default="", help="Path to file containing token")
+    art_sub = p_art.add_subparsers(dest="artifact_action", required=True)
+
+    art_up = art_sub.add_parser("upload", help="Upload a local file as a Hub artifact")
+    art_up.add_argument("file_path", help="Local file path to upload")
+    art_up.add_argument("--thread-id", default="", help="Optional thread ID")
+    art_up.add_argument("--filename", default="", help="Override artifact filename")
+    art_up.set_defaults(func=_cmd_artifact)
+
+    art_ls = art_sub.add_parser("list", help="List artifacts (optionally by thread)")
+    art_ls.add_argument("--thread-id", default="", help="Optional thread ID")
+    art_ls.set_defaults(func=_cmd_artifact)
+
+    art_dl = art_sub.add_parser("download", help="Download an artifact by ID")
+    art_dl.add_argument("artifact_id", help="Artifact ID")
+    art_dl.add_argument("--output", "-o", default="", help="Destination file path")
+    art_dl.set_defaults(func=_cmd_artifact)
 
     return parser
 

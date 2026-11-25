@@ -12,7 +12,7 @@ You have access to remote worker nodes through the `agentloom` MCP tools.
 1. `agentloom_list_agents` — Check which remote worker nodes are online, idle, or currently executing a task.
 2. `agentloom_send` — Dispatch a prompt containing `@node_name` mentions. Keep `wait_for_reply=true` for interactive tasks or pass an existing `thread_id` to continue a conversation.
 3. `agentloom_list_threads` / `agentloom_get_thread` — Inspect collaboration history, thread artifacts, or fetch delayed replies if `agentloom_send` timed out.
-4. `agentloom_upload_artifact` / `agentloom_download_artifact` — Transfer build logs, config bundles, or binaries without flooding chat context.
+4. `agentloom_upload_artifact` / `agentloom_download_artifact` — Transfer build logs, config bundles, or binaries without flooding chat context. On v0.3.0+ workers, artifacts referenced in threads are auto-downloaded to the worker inbox, and remote workers can return files via `[[ARTIFACT_UPLOAD: /path/to/file]]`.
 5. `agentloom_request_approval` — Request explicit admin approval before high-risk changes and wait for decision.
 6. `agentloom_control` — Restart an online worker node cleanly (admin token only).
 

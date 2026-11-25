@@ -414,6 +414,7 @@ class HubState:
     async def deliver_to_agents(self, sender: str, content: str, mentions: list[str], thread: Thread) -> list[str]:
         delivered = []
         recent_msgs = thread.messages[-self.cfg.recent_context_limit :]
+        thread_artifacts = await self.db.run(self.db.list_artifacts_sync, thread.id)
         for mentioned in mentions:
             if mentioned == sender:
                 continue
@@ -431,6 +432,7 @@ class HubState:
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                                 "thread_info": thread.to_dict(),
                                 "recent_messages": recent_msgs,
+                                "thread_artifacts": thread_artifacts[-10:],
                             },
                             ensure_ascii=False,
                         )

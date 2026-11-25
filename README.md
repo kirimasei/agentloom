@@ -143,10 +143,13 @@ bash deploy/install-worker.sh \
 
 ---
 
-## V2 协作增强能力
+## V2 / V3 协作增强能力
 
 1. **实时流式进度（`stream_chunk` -> `agent_stream`）**：所有内置适配器（`hermes` / `openai` / `qwenpaw` / `cli` / `echo`）均支持在执行过程中把输出流式推给控制台与线程观察者，长任务无需盲等。
-2. **文件与构建产物中转（`/api/artifacts`）**：支持在 Web 控制台点击 `📎` 上传，或通过 MCP `agentloom_upload_artifact` / `agentloom_download_artifact` 传输日志、配置与小体量构建产物（带 SHA-256 校验、路径清洗与 `X-Content-Type-Options: nosniff`，受限 Token 按线程 ACL 隔离）。
+2. **双向托管文件与构建产物中转（v0.3.0 Worker Bridge）**：
+   - 本地通过 MCP `agentloom_upload_artifact` / `agentloom_download_artifact` 或 `agentloom artifact upload|list|download` CLI 传输；
+   - 远端 Worker 收到含 `art_xxx` 或线程附件的消息时，自动校验 SHA-256 预下载到本机 inbox 并注入本地路径；
+   - 远端 Agent 在回复中单独一行输出 `[[ARTIFACT_UPLOAD: /path/to/file]]`（可选 `| custom_name.ext`），Worker 运行时自动安全上传（硬拦截 `.token` / `.env` / SSH 私钥等敏感路径）并替换为带 `art_id` 与 SHA-256 的回执，彻底突破 8000 字符消息截断。
 3. **高危操作人工审批门（HITL Approvals）**：在 Worker 启动时传入 `--require-approval-patterns "rm -rf,systemctl restart,drop table"`，命中规则的任务会先向中枢发起 `approval_request` 暂停等待；只有 `admin` 在控制台「🛡️ 审批」或线程卡片点「批准」后才会放行，否则拦截并回传拒绝说明。
 
 ---

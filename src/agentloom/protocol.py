@@ -2,11 +2,86 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 from typing import Optional
 
 MENTION_PATTERN = re.compile(r"(?<![A-Za-z0-9_.-])@([A-Za-z0-9_][\w-]*)")
+ARTIFACT_UPLOAD_PATTERN = re.compile(r"^\s*\[\[ARTIFACT_UPLOAD:\s*(.+?)\s*\]\]\s*$", re.MULTILINE)
+ARTIFACT_ID_PATTERN = re.compile(r"\b(art_\d+_[0-9a-fA-F]{6,16})\b")
+
+_SENSITIVE_FILENAMES = {
+    ".env",
+    "auth.json",
+    "credentials.json",
+    "id_rsa",
+    "id_ed25519",
+    "authorized_keys",
+    "known_hosts",
+    "shadow",
+    "gshadow",
+    "sudoers",
+}
+_SENSITIVE_EXTENSIONS = (".token", ".pem", ".key", ".p12", ".pfx")
+_SENSITIVE_DIR_FRAGMENTS = (
+    "/.secrets/",
+    "/.ssh/",
+    "/.agentloom-worker/",
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/sudoers",
+)
+
+
+def extract_artifact_upload_directives(content: str) -> list[tuple[str, Optional[str]]]:
+    """Extract deduplicated [[ARTIFACT_UPLOAD: path | custom_name]] directives outside code blocks."""
+    text = re.sub(r"```[\s\S]*?```", " ", content or "")
+    seen: set[tuple[str, Optional[str]]] = set()
+    directives: list[tuple[str, Optional[str]]] = []
+    for raw_inner in ARTIFACT_UPLOAD_PATTERN.findall(text):
+        if "|" in raw_inner:
+            raw_path, _, raw_name = raw_inner.partition("|")
+            path_str = raw_path.strip().strip('"').strip("'")
+            custom_name: Optional[str] = raw_name.strip().strip('"').strip("'") or None
+        else:
+            path_str = raw_inner.strip().strip('"').strip("'")
+            custom_name = None
+        if not path_str:
+            continue
+        item = (path_str, custom_name)
+        if item not in seen:
+            seen.add(item)
+            directives.append(item)
+    return directives
+
+
+def sanitize_artifact_filename(filename: str) -> str:
+    """Keep basename only and replace unsafe characters for artifact filenames."""
+    base = os.path.basename((filename or "").replace("\\", "/")).strip()
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._")
+    return cleaned[:120] or "artifact.bin"
+
+
+def is_sensitive_artifact_path(path: str) -> Optional[str]:
+    """Return a denial reason if path points to a credential/secret file, else None."""
+    try:
+        resolved = os.path.realpath(os.path.expanduser(path))
+    except OSError:
+        resolved = os.path.abspath(os.path.expanduser(path))
+    norm = resolved.replace("\\", "/").lower()
+    fname = os.path.basename(norm)
+
+    if fname in _SENSITIVE_FILENAMES or fname.startswith(".env."):
+        return f"Refused sensitive file '{fname}'"
+    if fname.startswith("id_rsa.") or fname.startswith("id_ed25519."):
+        return f"Refused SSH key file '{fname}'"
+    if any(fname.endswith(ext) for ext in _SENSITIVE_EXTENSIONS):
+        return f"Refused credential extension '{fname}'"
+    for frag in _SENSITIVE_DIR_FRAGMENTS:
+        if frag in norm or norm.endswith(frag.rstrip("/")):
+            return f"Refused sensitive path matching '{frag}'"
+    return None
 
 
 def extract_mentions(content: str, exclude: Optional[str] = None) -> list[str]:
