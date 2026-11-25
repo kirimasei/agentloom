@@ -21,4 +21,5 @@ You have access to remote worker nodes through the `agentloom` MCP tools.
 - **Verify availability first**: Call `agentloom_list_agents` before delegating work so you know exact node names and online status.
 - **Keep @mentions explicit and bounded**: Every task prompt must `@node_name` the intended worker(s). Instruct workers not to `@` other nodes unless a multi-hop handoff is explicitly required.
 - **Audit before deploy**: When coordinating a local-to-remote deployment, confirm local build/tests pass first, then ask the remote worker to audit its current service state before applying changes and verifying live endpoints.
+- **Local strong coding, remote simple execution**: Remote VPS/container nodes typically run lightweight/smaller models suited only for deterministic deployment, service checks, restarts, and smoke tests. Perform complex coding, refactoring, and building locally, then upload or deliver finished artifacts with explicit atomic deployment steps.
 - **Fact-only reporting**: Report only outputs, PIDs, URLs, and HTTP checks actually returned by the remote worker or observed locally.

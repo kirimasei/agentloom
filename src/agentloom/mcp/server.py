@@ -42,7 +42,10 @@ def resolve_settings(
     token: Optional[str] = None,
     sender: Optional[str] = None,
 ) -> tuple[str, str, str]:
-    """Resolve URL, token, and sender with CLI > env > .env > legacy env fallback."""
+    """Resolve URL, token, and sender with CLI > env > AGENTLOOM_ENV_FILE > .env > legacy env fallback."""
+    env_file = (os.environ.get("AGENTLOOM_ENV_FILE") or "").strip()
+    if env_file:
+        _load_dotenv_file(env_file)
     _load_dotenv_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
     _load_dotenv_file(os.path.join(os.getcwd(), ".env"))
 
@@ -203,6 +206,7 @@ class AgentLoomMCPClient:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
         headers = {
             "X-Token": self.token,
+            "Authorization": f"Bearer {self.token}",
             "Accept": "*/*",
             "User-Agent": f"agentloom-mcp/{__version__}",
         }
